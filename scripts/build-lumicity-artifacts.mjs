@@ -35,7 +35,7 @@ function packageMetadata(packageDir) {
 function pack(packageDir, outputDir) {
 	const stdout = run(
 		"npm",
-		["pack", packageDir, "--json", "--ignore-scripts", "--pack-destination", outputDir],
+		["pack", resolve(root, packageDir), "--json", "--ignore-scripts", "--pack-destination", outputDir],
 		{ capture: true },
 	);
 	const result = JSON.parse(stdout);
