@@ -421,6 +421,14 @@ async function refreshModelCatalogs(agentDir: string): Promise<void> {
 	console.log(chalk.green("Model catalogs refreshed"));
 }
 
+function printLumicitySelfUpdateDisabled(): void {
+	console.error(chalk.red(`${APP_NAME} self-update is disabled in the Lumicity fork.`));
+	console.error(
+		chalk.dim(
+			"Run the fork checkout's scripts/update-pi-lumicity.ps1 with Windows PowerShell; it verifies and packs a candidate before changing the live installation.",
+		),
+	);
+}
 function printSelfUpdateUnavailable(
 	npmCommand?: string[],
 	updatePackageTarget: SelfUpdatePackageTarget = PACKAGE_NAME,
@@ -732,6 +740,15 @@ export async function handlePackageCommand(
 			process.exitCode = 1;
 		}
 		return true;
+	}
+
+	if (options.command === "update") {
+		const target = options.updateTarget ?? { type: "self" };
+		if (updateTargetIncludesSelf(target)) {
+			printLumicitySelfUpdateDisabled();
+			process.exitCode = 1;
+			return true;
+		}
 	}
 
 	const cwd = process.cwd();

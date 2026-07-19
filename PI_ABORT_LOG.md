@@ -80,6 +80,30 @@ Reason: Windows process teardown can be slow or partially fail, but that physica
 
 The repository-wide `npm run check` gate passes. Targeted AgentSession persistence/settlement, interactive cancellation/status, and native Windows cleanup suites pass, and the coding-agent package builds. The live npm route remains unchanged.
 
+### 2026-07-19 — Keep subagent ownership in the repo-owned extension
+
+The separately maintained `@tintinweb/pi-subagents@0.14.1-lumicity.3` extension implements setup abort races, partial-session disposal, fresh spawn/resume controllers, prompt logical settlement, turn-owned direct background work, session-owned schedules, and a process-wide descendant cancellation graph. The extension is committed in the Lumicity repository at `a1704d6`.
+
+Reason: this behavior belongs to the extension that creates and tracks descendants. Duplicating it into the Pi monorepo would create two authorities and make extension updates unsafe.
+
+### 2026-07-19 — Disable canonical self-update in the fork
+
+Every self-including built-in update form refuses before release lookup or package mutation and directs operators to `scripts/update-pi-lumicity.ps1`. Extension-only and model-catalog updates remain available.
+
+Reason: the canonical updater can replace the fork with an official package of the same identity. A same-name fork must fail closed and route updates through the workflow that reapplies and verifies the Lumicity patch stack.
+
+### 2026-07-19 — Package all forked identities as one verified artifact set
+
+The release builder packs `@earendil-works/pi-ai`, `pi-tui`, `pi-agent-core`, and `pi-coding-agent` together, installs all four tarballs into an isolated global-prefix candidate, verifies exact names/versions, runs the candidate CLI, and executes a never-settling-tool abort probe against the installed files. SHA-256 hashes and source/upstream commits are written to `provenance.json`.
+
+Reason: installing only the coding-agent tarball would allow npm to satisfy its core dependency from the canonical registry and silently lose the cancellation patch. The four-package artifact set preserves public identities while proving the installed dependency graph.
+
+### 2026-07-19 — Keep live installation as an explicit final gate
+
+`update-pi-lumicity.ps1` defaults to verification-only. `-Install` is required to change the global npm route, and post-install CLI plus abort probes must pass; otherwise the updater reinstalls the previous recorded artifact set or the previous canonical version.
+
+Reason: source and tarball success are not sufficient evidence for changing the daily driver. Installation must remain explicit, reversible, and later than independent review.
+
 ## Planned commit units
 
 1. Fork baseline and implementation record.
