@@ -105,7 +105,7 @@ try {
     # ordinary AI build refreshes them from mutable network APIs, which is not
     # reproducible and can change source contracts during a verified update.
     Invoke-Native npm --workspace "@earendil-works/pi-tui" run build
-    Invoke-Native npm exec -- tsgo -p packages/ai/tsconfig.build.json
+    Invoke-Native -FilePath npm -Arguments @("exec", "--", "tsgo", "-p", "packages/ai/tsconfig.build.json")
     Invoke-Native npm --workspace "@earendil-works/pi-agent-core" run build
     Invoke-Native npm --workspace "@earendil-works/pi-coding-agent" run build
 
