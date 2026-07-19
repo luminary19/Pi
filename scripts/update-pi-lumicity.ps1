@@ -100,7 +100,7 @@ try {
     Invoke-Native npm run check
     Invoke-Native npm --workspace "@earendil-works/pi-agent-core" test -- --run test/cancellation.test.ts test/agent.test.ts test/agent-loop.test.ts
     Invoke-Native npm --workspace "@earendil-works/pi-coding-agent" test -- test/suite/regressions/6363-agent-settled-event.test.ts test/interactive-mode-status.test.ts test/bash-close-hang-windows.test.ts
-    Invoke-Native npm --workspace "@earendil-works/pi-coding-agent" test -- test/package-command-paths.test.ts -t "refuses .* self-update"
+    Invoke-Native -FilePath npm -Arguments @("--workspace", "@earendil-works/pi-coding-agent", "test", "--", "test/package-command-paths.test.ts", "-t", "refuses .* self-update")
     Invoke-Native npm run build
 
     if (-not (Test-Path $SubagentsRoot)) {
