@@ -42,6 +42,22 @@ Implement prompt logical settlement as a core invariant with abort races, checkp
 
 Reason: a non-cooperative provider, tool, extension listener, or Windows child process must not retain control of the interactive session after explicit abort.
 
+### 2026-07-19 — Make physical work tracking promise-based, not timeout-based
+
+Each run generation owns a dynamic physical-work tracker. When abort wins a race, the exact provider, iterator, tool, hook, update, or listener promise is registered with that tracker. `waitForLogicalIdle()` and the compatibility `waitForIdle()` resolve after coherent cancellation finalization; `waitForPhysicalSettlement()` resolves only after registered work actually settles. Detached rejections are retained in `physicalWorkFailures` with generation, label, error, and timestamp.
+
+Reason: a fixed timeout can bound waiting but cannot establish ownership, suppress stale callbacks, or prove cleanup. Tracking the real promises preserves diagnostics without returning editor ownership to non-cooperative work.
+
+### 2026-07-19 — Preserve transcript completeness on mid-batch abort
+
+Every tool call in an already-committed assistant tool-use message receives one source-ordered terminal `ToolResultMessage`. Calls that emitted `tool_execution_start` also receive exactly one `tool_execution_end`; calls not yet started receive only a synthetic aborted result. Ordinary `afterToolCall` hooks are skipped when cancellation wins.
+
+Reason: prompt cancellation must not leave malformed tool-call history that breaks the next provider request, while execution events must continue to describe work that actually started.
+
+### 2026-07-19 — Core verification checkpoint
+
+The isolated agent-core package builds successfully. New cancellation tests cover a never-settling tool, the parallel preparation race, a provider iterator that never yields, stale-generation suppression, physical settlement tracking, and a never-settling lifecycle listener. Existing `agent.test.ts` and `agent-loop.test.ts` suites remain green. The global npm route remains unchanged.
+
 ## Planned commit units
 
 1. Fork baseline and implementation record.

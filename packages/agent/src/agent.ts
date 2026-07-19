@@ -156,10 +156,58 @@ class PendingMessageQueue {
 	}
 }
 
+export interface PhysicalWorkFailure {
+	generation: number;
+	label: string;
+	error: unknown;
+	timestamp: number;
+}
+
+type RunStatus = "running" | "cancel-requested" | "logically-idle";
+
+class PhysicalWorkTracker {
+	private pending = 1;
+	private rootFinished = false;
+	private resolvePromise = () => {};
+	private readonly onFailure: (label: string, error: unknown) => void;
+	readonly promise = new Promise<void>((resolve) => {
+		this.resolvePromise = resolve;
+	});
+
+	constructor(onFailure: (label: string, error: unknown) => void) {
+		this.onFailure = onFailure;
+	}
+
+	add(work: PromiseLike<unknown>, label: string): void {
+		this.pending++;
+		void Promise.resolve(work).then(
+			() => this.completeOne(),
+			(error: unknown) => {
+				this.onFailure(label, error);
+				this.completeOne();
+			},
+		);
+	}
+
+	finishRoot(): void {
+		if (this.rootFinished) return;
+		this.rootFinished = true;
+		this.completeOne();
+	}
+
+	private completeOne(): void {
+		this.pending--;
+		if (this.pending === 0) this.resolvePromise();
+	}
+}
+
 type ActiveRun = {
+	generation: number;
+	status: RunStatus;
 	promise: Promise<void>;
 	resolve: () => void;
 	abortController: AbortController;
+	physicalWork: PhysicalWorkTracker;
 };
 
 /**
@@ -196,6 +244,9 @@ export class Agent {
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 	private activeRun?: ActiveRun;
+	private nextGeneration = 0;
+	private readonly physicalSettlements = new Set<Promise<void>>();
+	private readonly cleanupFailures: PhysicalWorkFailure[] = [];
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
 	/** Optional per-level thinking token budgets forwarded to the stream function. */
@@ -231,12 +282,9 @@ export class Agent {
 	/**
 	 * Subscribe to agent lifecycle events.
 	 *
-	 * Listener promises are awaited in subscription order and are included in
-	 * the current run's settlement. Listeners also receive the active abort
-	 * signal for the current run.
-	 *
-	 * `agent_end` is the final emitted event for a run, but the agent does not
-	 * become idle until all awaited listeners for that event have settled.
+	 * Listener promises are awaited in subscription order during normal execution.
+	 * Once cancellation is requested, pending and terminal-listener work is tracked
+	 * physically without retaining logical ownership of the run.
 	 */
 	subscribe(listener: (event: AgentEvent, signal: AbortSignal) => Promise<void> | void): () => void {
 		this.listeners.add(listener);
@@ -306,18 +354,39 @@ export class Agent {
 		return this.activeRun?.abortController.signal;
 	}
 
-	/** Abort the current run, if one is active. */
-	abort(): void {
-		this.activeRun?.abortController.abort();
+	/** Synchronously and idempotently request cancellation of the active generation. */
+	requestAbort(reason: unknown = new Error("User aborted")): void {
+		const run = this.activeRun;
+		if (!run || run.status !== "running") return;
+		run.status = "cancel-requested";
+		run.abortController.abort(reason);
 	}
 
-	/**
-	 * Resolve when the current run and all awaited event listeners have finished.
-	 *
-	 * This resolves after `agent_end` listeners settle.
-	 */
-	waitForIdle(): Promise<void> {
+	/** Abort the current run, if one is active. */
+	abort(reason?: unknown): void {
+		this.requestAbort(reason);
+	}
+
+	/** Resolve when the active generation becomes logically idle. */
+	waitForLogicalIdle(): Promise<void> {
 		return this.activeRun?.promise ?? Promise.resolve();
+	}
+
+	/** Compatibility alias for logical idle. */
+	waitForIdle(): Promise<void> {
+		return this.waitForLogicalIdle();
+	}
+
+	/** Resolve when all currently tracked detached work has physically settled. */
+	async waitForPhysicalSettlement(): Promise<void> {
+		while (this.physicalSettlements.size > 0) {
+			await Promise.all(this.physicalSettlements);
+		}
+	}
+
+	/** Failures observed from detached physical work. */
+	get physicalWorkFailures(): readonly PhysicalWorkFailure[] {
+		return this.cleanupFailures.slice();
 	}
 
 	/** Clear transcript state, runtime state, and queued messages. */
@@ -397,25 +466,25 @@ export class Agent {
 		messages: AgentMessage[],
 		options: { skipInitialSteeringPoll?: boolean } = {},
 	): Promise<void> {
-		await this.runWithLifecycle(async (signal) => {
+		await this.runWithLifecycle(async (run) => {
 			await runAgentLoop(
 				messages,
 				this.createContextSnapshot(),
-				this.createLoopConfig(options),
-				(event) => this.processEvents(event),
-				signal,
+				this.createLoopConfig(run, options),
+				(event) => this.processEvents(event, run),
+				run.abortController.signal,
 				this.streamFn,
 			);
 		});
 	}
 
 	private async runContinuation(): Promise<void> {
-		await this.runWithLifecycle(async (signal) => {
+		await this.runWithLifecycle(async (run) => {
 			await runAgentLoopContinue(
 				this.createContextSnapshot(),
-				this.createLoopConfig(),
-				(event) => this.processEvents(event),
-				signal,
+				this.createLoopConfig(run),
+				(event) => this.processEvents(event, run),
+				run.abortController.signal,
 				this.streamFn,
 			);
 		});
@@ -429,8 +498,9 @@ export class Agent {
 		};
 	}
 
-	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
+	private createLoopConfig(run: ActiveRun, options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
 		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
+		const signal = run.abortController.signal;
 		return {
 			model: this._state.model,
 			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
@@ -443,13 +513,14 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
+			registerPhysicalWork: (work, label) => run.physicalWork.add(work, label),
 			prepareNextTurn:
 				this.prepareNextTurnWithContext || this.prepareNextTurn
 					? async (context) => {
 							if (this.prepareNextTurnWithContext) {
-								return await this.prepareNextTurnWithContext(context, this.signal);
+								return await this.prepareNextTurnWithContext(context, signal);
 							}
-							return await this.prepareNextTurn?.(this.signal);
+							return await this.prepareNextTurn?.(signal);
 						}
 					: undefined,
 			convertToLlm: this.convertToLlm,
@@ -466,32 +537,48 @@ export class Agent {
 		};
 	}
 
-	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
+	private async runWithLifecycle(executor: (run: ActiveRun) => Promise<void>): Promise<void> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing.");
 		}
 
+		const generation = ++this.nextGeneration;
 		const abortController = new AbortController();
 		let resolvePromise = () => {};
 		const promise = new Promise<void>((resolve) => {
 			resolvePromise = resolve;
 		});
-		this.activeRun = { promise, resolve: resolvePromise, abortController };
+		const physicalWork = new PhysicalWorkTracker((label, error) => {
+			this.cleanupFailures.push({ generation, label, error, timestamp: Date.now() });
+		});
+		const run: ActiveRun = {
+			generation,
+			status: "running",
+			promise,
+			resolve: resolvePromise,
+			abortController,
+			physicalWork,
+		};
+		this.activeRun = run;
+		this.physicalSettlements.add(physicalWork.promise);
+		void physicalWork.promise.then(() => this.physicalSettlements.delete(physicalWork.promise));
 
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;
 		this._state.errorMessage = undefined;
 
 		try {
-			await executor(abortController.signal);
+			await executor(run);
 		} catch (error) {
-			await this.handleRunFailure(error, abortController.signal.aborted);
+			await this.handleRunFailure(error, abortController.signal.aborted, run);
 		} finally {
-			this.finishRun();
+			physicalWork.finishRoot();
+			this.finishRun(run);
 		}
 	}
 
-	private async handleRunFailure(error: unknown, aborted: boolean): Promise<void> {
+	private async handleRunFailure(error: unknown, aborted: boolean, run: ActiveRun): Promise<void> {
+		if (this.activeRun !== run) return;
 		const failureMessage = {
 			role: "assistant",
 			content: [{ type: "text", text: "" }],
@@ -503,28 +590,25 @@ export class Agent {
 			errorMessage: error instanceof Error ? error.message : String(error),
 			timestamp: Date.now(),
 		} satisfies AgentMessage;
-		await this.processEvents({ type: "message_start", message: failureMessage });
-		await this.processEvents({ type: "message_end", message: failureMessage });
-		await this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] });
-		await this.processEvents({ type: "agent_end", messages: [failureMessage] });
+		await this.processEvents({ type: "message_start", message: failureMessage }, run);
+		await this.processEvents({ type: "message_end", message: failureMessage }, run);
+		await this.processEvents({ type: "turn_end", message: failureMessage, toolResults: [] }, run);
+		await this.processEvents({ type: "agent_end", messages: [failureMessage] }, run);
 	}
 
-	private finishRun(): void {
+	private finishRun(run: ActiveRun): void {
+		if (this.activeRun !== run) return;
+		run.status = "logically-idle";
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
-		this.activeRun?.resolve();
+		run.resolve();
 		this.activeRun = undefined;
 	}
 
-	/**
-	 * Reduce internal state for a loop event, then await listeners.
-	 *
-	 * `agent_end` only means no further loop events will be emitted. The run is
-	 * considered idle later, after all awaited listeners for `agent_end` finish
-	 * and `finishRun()` clears runtime-owned state.
-	 */
-	private async processEvents(event: AgentEvent): Promise<void> {
+	/** Reduce state for one generation, then notify listeners under its cancellation boundary. */
+	private async processEvents(event: AgentEvent, run: ActiveRun): Promise<void> {
+		if (this.activeRun !== run) return;
 		switch (event.type) {
 			case "message_start":
 				this._state.streamingMessage = event.message;
@@ -564,12 +648,62 @@ export class Agent {
 				break;
 		}
 
-		const signal = this.activeRun?.abortController.signal;
-		if (!signal) {
-			throw new Error("Agent listener invoked outside active run");
-		}
+		const signal = run.abortController.signal;
+		const abortedAtEntry = signal.aborted;
 		for (const listener of this.listeners) {
-			await listener(event, signal);
+			if (this.activeRun !== run) return;
+			let listenerWork: Promise<void>;
+			try {
+				listenerWork = Promise.resolve(listener(event, signal));
+			} catch (error) {
+				listenerWork = Promise.reject(error);
+			}
+			if (abortedAtEntry) {
+				run.physicalWork.add(listenerWork, `event listener:${event.type}`);
+				continue;
+			}
+			const outcome = await this.awaitListener(listenerWork, run, event.type);
+			if (outcome === "aborted") return;
 		}
+	}
+
+	private awaitListener(
+		work: Promise<void>,
+		run: ActiveRun,
+		eventType: AgentEvent["type"],
+	): Promise<"settled" | "aborted"> {
+		const signal = run.abortController.signal;
+		if (signal.aborted) {
+			run.physicalWork.add(work, `event listener:${eventType}`);
+			return Promise.resolve("aborted");
+		}
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			const finish = (outcome: "settled" | "aborted") => {
+				if (settled) return;
+				settled = true;
+				signal.removeEventListener("abort", onAbort);
+				resolve(outcome);
+			};
+			const onAbort = () => {
+				if (settled) return;
+				run.physicalWork.add(work, `event listener:${eventType}`);
+				finish("aborted");
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			if (signal.aborted) {
+				onAbort();
+				return;
+			}
+			void work.then(
+				() => finish("settled"),
+				(error: unknown) => {
+					if (settled) return;
+					settled = true;
+					signal.removeEventListener("abort", onAbort);
+					reject(error);
+				},
+			);
+		});
 	}
 }

@@ -139,6 +139,11 @@ export interface PrepareNextTurnContext extends ShouldStopAfterTurnContext {}
 
 export interface AgentLoopConfig extends SimpleStreamOptions {
 	model: Model<any>;
+	/**
+	 * Register work that was detached after logical cancellation so callers can
+	 * observe its eventual settlement without keeping the active run busy.
+	 */
+	registerPhysicalWork?: (work: PromiseLike<unknown>, label: string) => void;
 
 	/**
 	 * Converts AgentMessage[] to LLM-compatible Message[] before each LLM call.
@@ -333,9 +338,10 @@ export interface AgentState {
 	set messages(messages: AgentMessage[]);
 	get messages(): AgentMessage[];
 	/**
-	 * True while the agent is processing a prompt or continuation.
+	 * True while the current generation owns the prompt lifecycle.
 	 *
-	 * This remains true until awaited `agent_end` listeners settle.
+	 * Explicit abort clears this after logical finalization; detached provider, tool,
+	 * listener, and process cleanup may still be settling physically.
 	 */
 	readonly isStreaming: boolean;
 	/** Partial assistant message for the current streamed response, if any. */
