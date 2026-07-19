@@ -1,16 +1,17 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const root = resolve(import.meta.dirname, "..");
 const packageDirs = ["packages/ai", "packages/tui", "packages/agent", "packages/coding-agent"];
+const npmCli = process.env.npm_execpath ?? join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
 
 function run(command, args, options = {}) {
 	const result = spawnSync(command, args, {
 		cwd: options.cwd ?? root,
 		encoding: "utf8",
-		shell: process.platform === "win32" && command === "npm",
+		shell: false,
 		stdio: options.capture ? "pipe" : "inherit",
 	});
 	if (result.status !== 0) {
@@ -24,6 +25,10 @@ function git(...args) {
 	return run("git", args, { capture: true });
 }
 
+function runNpm(args, options = {}) {
+	return run(process.execPath, [npmCli, ...args], options);
+}
+
 function sha256(path) {
 	return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
@@ -33,8 +38,7 @@ function packageMetadata(packageDir) {
 }
 
 function pack(packageDir, outputDir) {
-	const stdout = run(
-		"npm",
+	const stdout = runNpm(
 		["pack", resolve(root, packageDir), "--json", "--ignore-scripts", "--pack-destination", outputDir],
 		{ capture: true },
 	);
@@ -79,8 +83,8 @@ const artifacts = packageDirs.map((packageDir) => {
 	};
 });
 
-run("npm", ["install", "--global", "--prefix", candidatePrefix, ...artifacts.map((item) => item.path)]);
-const candidateRoot = run("npm", ["root", "--global", "--prefix", candidatePrefix], { capture: true });
+runNpm(["install", "--global", "--prefix", candidatePrefix, ...artifacts.map((item) => item.path)]);
+const candidateRoot = runNpm(["root", "--global", "--prefix", candidatePrefix], { capture: true });
 const packageChecks = artifacts.map((artifact) => {
 	const manifestPath = join(candidateRoot, ...artifact.name.split("/"), "package.json");
 	const metadata = JSON.parse(readFileSync(manifestPath, "utf8"));
