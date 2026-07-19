@@ -178,6 +178,19 @@ export function sanitizeBinaryOutput(str: string): string {
  * shutdown signals (SIGHUP/SIGTERM).
  */
 const trackedDetachedChildPids = new Set<number>();
+const TASKKILL_TIMEOUT_MS = 2000;
+const TERMINATION_VERIFY_DELAY_MS = 50;
+
+export type ProcessTerminationStatus = "confirmed" | "failed" | "unconfirmed";
+
+export interface ProcessTreeTerminationResult {
+	pid: number;
+	status: ProcessTerminationStatus;
+	method: "taskkill" | "process-group" | "direct-child";
+	exitCode: number | null;
+	durationMs: number;
+	error?: string;
+}
 
 export function trackDetachedChildPid(pid: number): void {
 	trackedDetachedChildPids.add(pid);
@@ -187,39 +200,114 @@ export function untrackDetachedChildPid(pid: number): void {
 	trackedDetachedChildPids.delete(pid);
 }
 
-export function killTrackedDetachedChildren(): void {
-	for (const pid of trackedDetachedChildPids) {
-		killProcessTree(pid);
-	}
+export function killTrackedDetachedChildren(): Promise<ProcessTreeTerminationResult[]> {
+	const terminations = [...trackedDetachedChildPids].map((pid) => killProcessTree(pid));
 	trackedDetachedChildPids.clear();
+	return Promise.all(terminations);
 }
 
-/**
- * Kill a process and all its children (cross-platform)
- */
-export function killProcessTree(pid: number): void {
-	if (process.platform === "win32") {
-		// Use taskkill on Windows to kill process tree
+function getProcessAliveState(pid: number): boolean | undefined {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
+		return undefined;
+	}
+}
+
+function delay(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function killWindowsProcessTree(pid: number, startedAt: number): Promise<ProcessTreeTerminationResult> {
+	const taskkillResult = await new Promise<{ exitCode: number | null; error?: string }>((resolve) => {
+		let settled = false;
+		let timeout: NodeJS.Timeout | undefined;
+		const finish = (exitCode: number | null, error?: string) => {
+			if (settled) return;
+			settled = true;
+			if (timeout) clearTimeout(timeout);
+			resolve({ exitCode, error });
+		};
+
 		try {
-			spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
+			const taskkill = spawn("taskkill", ["/F", "/T", "/PID", String(pid)], {
 				stdio: "ignore",
-				detached: true,
 				windowsHide: true,
 			});
-		} catch {
-			// Ignore errors if taskkill fails
+			taskkill.once("error", (error) => finish(null, error.message));
+			taskkill.once("exit", (code) => finish(code));
+			timeout = setTimeout(() => {
+				taskkill.kill();
+				finish(null, `taskkill exceeded ${TASKKILL_TIMEOUT_MS}ms`);
+			}, TASKKILL_TIMEOUT_MS);
+		} catch (error) {
+			finish(null, error instanceof Error ? error.message : String(error));
 		}
-	} else {
-		// Use SIGKILL on Unix/Linux/Mac
+	});
+
+	if (taskkillResult.exitCode === 0) {
+		return {
+			pid,
+			status: "confirmed",
+			method: "taskkill",
+			exitCode: 0,
+			durationMs: performance.now() - startedAt,
+		};
+	}
+
+	let fallbackError: string | undefined;
+	try {
+		process.kill(pid, "SIGKILL");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+			fallbackError = error instanceof Error ? error.message : String(error);
+		}
+	}
+	await delay(TERMINATION_VERIFY_DELAY_MS);
+	const alive = getProcessAliveState(pid);
+	return {
+		pid,
+		status: alive === false ? "confirmed" : alive === true ? "failed" : "unconfirmed",
+		method: "direct-child",
+		exitCode: taskkillResult.exitCode,
+		durationMs: performance.now() - startedAt,
+		...(taskkillResult.error || fallbackError
+			? { error: [taskkillResult.error, fallbackError].filter(Boolean).join("; ") }
+			: {}),
+	};
+}
+
+/** Kill a process and all its children and report observable cleanup status. */
+export async function killProcessTree(pid: number): Promise<ProcessTreeTerminationResult> {
+	const startedAt = performance.now();
+	if (process.platform === "win32") return killWindowsProcessTree(pid, startedAt);
+
+	let method: ProcessTreeTerminationResult["method"] = "process-group";
+	let errorMessage: string | undefined;
+	try {
+		process.kill(-pid, "SIGKILL");
+	} catch (groupError) {
+		method = "direct-child";
 		try {
-			process.kill(-pid, "SIGKILL");
-		} catch {
-			// Fallback to killing just the child if process group kill fails
-			try {
-				process.kill(pid, "SIGKILL");
-			} catch {
-				// Process already dead
+			process.kill(pid, "SIGKILL");
+		} catch (directError) {
+			if ((directError as NodeJS.ErrnoException).code !== "ESRCH") {
+				errorMessage = [groupError, directError]
+					.map((error) => (error instanceof Error ? error.message : String(error)))
+					.join("; ");
 			}
 		}
 	}
+	await delay(TERMINATION_VERIFY_DELAY_MS);
+	const alive = getProcessAliveState(pid);
+	return {
+		pid,
+		status: alive === false ? "confirmed" : alive === true && errorMessage ? "failed" : "unconfirmed",
+		method,
+		exitCode: null,
+		durationMs: performance.now() - startedAt,
+		...(errorMessage ? { error: errorMessage } : {}),
+	};
 }

@@ -58,6 +58,28 @@ Reason: prompt cancellation must not leave malformed tool-call history that brea
 
 The isolated agent-core package builds successfully. New cancellation tests cover a never-settling tool, the parallel preparation race, a provider iterator that never yields, stale-generation suppression, physical settlement tracking, and a never-settling lifecycle listener. Existing `agent.test.ts` and `agent-loop.test.ts` suites remain green. The global npm route remains unchanged.
 
+### 2026-07-19 — Keep session observers outside logical-idle ownership
+
+`AgentSession` now treats extension/session event delivery as generation-owned physical work. Cancellation persists the coherent aborted transcript and emits settlement without waiting for a non-cooperative `message_end`/session observer; late callbacks are generation-gated and their failures remain observed.
+
+Reason: extension observability must not be able to retain editor ownership or rewrite a later generation, but cancellation must still preserve the committed assistant/tool-result transcript before the next prompt.
+
+### 2026-07-19 — Acknowledge Escape synchronously and measure logical latency
+
+The interactive mode makes the first Escape acknowledgment immediate and idempotent, uses a stable `Cancelling...` to `Cancelled` state instead of an animation loop, and records bounded cancellation-latency samples for diagnostics.
+
+Reason: cancellation feedback belongs to the input path, not to eventual provider/tool/process cleanup. Repeated Escape presses must not start parallel cancellation flows or hide the first request's timing.
+
+### 2026-07-19 — Make Windows process cleanup observable without blocking readiness
+
+Process-tree cleanup now returns an observable promise with `taskkill` exit/error/duration details and a direct-child fallback. Bash suppresses post-abort output immediately, requests termination once, and tracks bounded cleanup asynchronously after logical settlement.
+
+Reason: Windows process teardown can be slow or partially fail, but that physical uncertainty must be diagnosable without freezing the editor or discarding the cleanup attempt.
+
+### 2026-07-19 — Coding-agent verification checkpoint
+
+The repository-wide `npm run check` gate passes. Targeted AgentSession persistence/settlement, interactive cancellation/status, and native Windows cleanup suites pass, and the coding-agent package builds. The live npm route remains unchanged.
+
 ## Planned commit units
 
 1. Fork baseline and implementation record.

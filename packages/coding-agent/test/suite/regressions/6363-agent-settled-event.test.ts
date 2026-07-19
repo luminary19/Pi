@@ -155,4 +155,101 @@ describe("regression #6363: agent settled event and idle waiting", () => {
 		expect(commandResults).toEqual([true]);
 		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
 	});
+
+	it("does not let a never-settling agent_settled observer retain logical idle", async () => {
+		let releaseObserver = () => {};
+		const observerReleased = new Promise<void>((resolve) => {
+			releaseObserver = resolve;
+		});
+		let markObserverStarted = () => {};
+		const observerStarted = new Promise<void>((resolve) => {
+			markObserverStarted = resolve;
+		});
+		const settledIdleStates: boolean[] = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_settled", async (_event, ctx) => {
+						settledIdleStates.push(ctx.isIdle());
+						markObserverStarted();
+						await observerReleased;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+
+		const prompt = harness.session.prompt("hello");
+		await observerStarted;
+		const logicalSettlement = await Promise.race([
+			prompt.then(() => true),
+			new Promise<false>((resolve) => setTimeout(() => resolve(false), 150)),
+		]);
+		expect(logicalSettlement).toBe(true);
+		expect(harness.session.isIdle).toBe(true);
+		expect(settledIdleStates).toEqual([true]);
+		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+
+		const physicalSettlement = harness.session.waitForPhysicalSettlement();
+		const physicalSettledEarly = await Promise.race([
+			physicalSettlement.then(() => true),
+			new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+		]);
+		expect(physicalSettledEarly).toBe(false);
+		releaseObserver();
+		await physicalSettlement;
+	});
+
+	it("finalizes and persists abort while a message_end handler remains pending", async () => {
+		let releaseHandler = () => {};
+		const handlerReleased = new Promise<void>((resolve) => {
+			releaseHandler = resolve;
+		});
+		let markHandlerStarted = () => {};
+		const handlerStarted = new Promise<void>((resolve) => {
+			markHandlerStarted = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_end", async (event) => {
+						if (event.message.role !== "assistant") return;
+						markHandlerStarted();
+						await handlerReleased;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+
+		const prompt = harness.session.prompt("hello");
+		await handlerStarted;
+		const abort = harness.session.abort("test abort");
+		const logicallySettled = await Promise.race([
+			Promise.all([prompt, abort]).then(() => true),
+			new Promise<false>((resolve) => setTimeout(() => resolve(false), 150)),
+		]);
+		expect(logicallySettled).toBe(true);
+		expect(harness.session.isIdle).toBe(true);
+
+		const assistantEvents = harness.eventsOfType("message_end").filter((event) => event.message.role === "assistant");
+		expect(assistantEvents).toHaveLength(1);
+		expect(assistantEvents[0].message.role === "assistant" && assistantEvents[0].message.stopReason).toBe("aborted");
+		const persistedRoles = harness.session.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "message")
+			.map((entry) => entry.message.role);
+		expect(persistedRoles).toEqual(["user", "assistant"]);
+
+		const physicalSettlement = harness.session.waitForPhysicalSettlement();
+		const physicalSettledEarly = await Promise.race([
+			physicalSettlement.then(() => true),
+			new Promise<false>((resolve) => setTimeout(() => resolve(false), 20)),
+		]);
+		expect(physicalSettledEarly).toBe(false);
+		releaseHandler();
+		await physicalSettlement;
+	});
 });

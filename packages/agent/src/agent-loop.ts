@@ -344,6 +344,10 @@ async function runLoop(
 
 				throwIfAborted(signal);
 				const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
+				if (signal?.aborted && message.stopReason !== "aborted") {
+					Object.assign(message, createAbortedAssistantMessage(config, message));
+					await emit({ type: "message_end", message });
+				}
 				turnMessage = message;
 				newMessages.push(message);
 

@@ -620,7 +620,7 @@ export class Agent {
 
 			case "message_end":
 				this._state.streamingMessage = undefined;
-				this._state.messages.push(event.message);
+				if (this._state.messages.at(-1) !== event.message) this._state.messages.push(event.message);
 				break;
 
 			case "tool_execution_start": {

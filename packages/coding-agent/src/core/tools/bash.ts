@@ -83,9 +83,7 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 	return {
 		exec: async (command, cwd, { onData, signal, timeout, env }) => {
 			const timeoutMs = resolveTimeoutMs(timeout);
-			if (signal?.aborted) {
-				throw new Error("aborted");
-			}
+			if (signal?.aborted) throw new Error("aborted");
 			const shellConfig = getShellConfig(options?.shellPath);
 			try {
 				await fsAccess(cwd, constants.F_OK);
@@ -106,40 +104,78 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
 				child.stdin?.end(command);
 			}
 			if (child.pid) trackDetachedChildPid(child.pid);
-			let timedOut = false;
+
+			let acceptingData = true;
 			let timeoutHandle: NodeJS.Timeout | undefined;
-			const onAbort = () => {
-				if (child.pid) killProcessTree(child.pid);
+			let terminationReason: "aborted" | "timeout" | undefined;
+			let terminationPromise: Promise<Awaited<ReturnType<typeof killProcessTree>>> | undefined;
+			let resolveTermination = (_reason: "aborted" | "timeout") => {};
+			const terminationRequested = new Promise<"aborted" | "timeout">((resolve) => {
+				resolveTermination = resolve;
+			});
+			const handleData = (data: Buffer) => {
+				if (acceptingData) onData(data);
 			};
+			const requestTermination = (reason: "aborted" | "timeout") => {
+				if (terminationReason) return;
+				terminationReason = reason;
+				acceptingData = false;
+				child.stdout?.removeListener("data", handleData);
+				child.stderr?.removeListener("data", handleData);
+				terminationPromise = child.pid
+					? killProcessTree(child.pid)
+					: Promise.resolve({
+							pid: -1,
+							status: "failed",
+							method: "direct-child",
+							exitCode: null,
+							durationMs: 0,
+							error: "Spawned process did not expose a pid",
+						});
+				resolveTermination(reason);
+			};
+			const onAbort = () => requestTermination("aborted");
+			let processSettled = false;
+			let terminationConfirmed = false;
 
 			try {
-				// Set timeout if provided.
 				if (timeoutMs !== undefined) {
-					timeoutHandle = setTimeout(() => {
-						timedOut = true;
-						if (child.pid) killProcessTree(child.pid);
-					}, timeoutMs);
+					timeoutHandle = setTimeout(() => requestTermination("timeout"), timeoutMs);
 				}
-				// Stream stdout and stderr.
-				child.stdout?.on("data", onData);
-				child.stderr?.on("data", onData);
-				// Handle abort signal by killing the entire process tree.
+				child.stdout?.on("data", handleData);
+				child.stderr?.on("data", handleData);
 				if (signal) {
 					if (signal.aborted) onAbort();
 					else signal.addEventListener("abort", onAbort, { once: true });
 				}
-				// Handle shell spawn errors and wait for the process to terminate without hanging
-				// on inherited stdio handles held by detached descendants.
-				const exitCode = await waitForChildProcess(child);
-				if (signal?.aborted) {
-					throw new Error("aborted");
+
+				const childExit = waitForChildProcess(child);
+				void childExit.catch(() => {});
+				const outcome = await Promise.race([
+					childExit.then((exitCode) => ({ kind: "exit" as const, exitCode })),
+					terminationRequested.then(async (reason) => ({
+						kind: "terminated" as const,
+						reason,
+						result: await terminationPromise!,
+					})),
+				]);
+
+				if (outcome.kind === "exit" && !terminationReason) {
+					processSettled = true;
+					return { exitCode: outcome.exitCode };
 				}
-				if (timedOut) {
-					throw new Error(`timeout:${timeout}`);
-				}
-				return { exitCode };
+				const reason = outcome.kind === "terminated" ? outcome.reason : terminationReason!;
+				const termination = outcome.kind === "terminated" ? outcome.result : await terminationPromise!;
+				terminationConfirmed = termination.status === "confirmed";
+				child.stdin?.destroy();
+				child.stdout?.destroy();
+				child.stderr?.destroy();
+				throw new Error(reason === "aborted" ? "aborted" : `timeout:${timeout}`, { cause: termination });
 			} finally {
-				if (child.pid) untrackDetachedChildPid(child.pid);
+				acceptingData = false;
+				child.stdout?.removeListener("data", handleData);
+				child.stderr?.removeListener("data", handleData);
+				if (child.pid && (processSettled || terminationConfirmed)) untrackDetachedChildPid(child.pid);
 				if (timeoutHandle) clearTimeout(timeoutHandle);
 				if (signal) signal.removeEventListener("abort", onAbort);
 			}

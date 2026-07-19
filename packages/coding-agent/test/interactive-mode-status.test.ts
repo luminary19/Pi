@@ -117,6 +117,69 @@ describe("InteractiveMode.showStatus", () => {
 	});
 });
 
+describe("InteractiveMode cancellation status", () => {
+	beforeAll(() => initTheme("dark"));
+
+	test("acknowledges the first abort request immediately and keeps repeats idempotent", () => {
+		const ui = new TUI(new VirtualTerminal(80, 24));
+		const indicators: Array<{ kind: string; dispose(): void }> = [];
+		const fakeThis: any = {
+			restoreQueuedMessagesToEditor: vi.fn(),
+			agent: { requestAbort: vi.fn() },
+			activeCancellationRequest: undefined,
+			nextCancellationRequest: 0,
+			escapeReceivedAt: undefined,
+			settingsManager: { getShowTerminalProgress: () => false },
+			ui,
+			showStatusIndicator: vi.fn((indicator) => {
+				indicators.push(indicator);
+			}),
+		};
+		const requestAbort = (InteractiveMode as any).prototype.requestInteractiveAbort;
+
+		requestAbort.call(fakeThis);
+		requestAbort.call(fakeThis);
+
+		expect(fakeThis.restoreQueuedMessagesToEditor).toHaveBeenCalledTimes(1);
+		expect(fakeThis.agent.requestAbort).toHaveBeenCalledTimes(2);
+		expect(fakeThis.activeCancellationRequest).toBe(1);
+		expect(fakeThis.escapeReceivedAt).toEqual(expect.any(Number));
+		expect(indicators).toHaveLength(1);
+		expect(indicators[0].kind).toBe("cancellation");
+		indicators.forEach((indicator) => {
+			indicator.dispose();
+		});
+	});
+
+	test("marks cancellation complete on logical agent settlement", async () => {
+		const ui = new TUI(new VirtualTerminal(80, 24));
+		const indicators: Array<{ kind: string; dispose(): void }> = [];
+		const fakeThis: any = {
+			isInitialized: true,
+			footer: { invalidate: vi.fn() },
+			activeCancellationRequest: 1,
+			escapeReceivedAt: performance.now(),
+			cancellationLatencySamples: [],
+			showStatusIndicator: vi.fn((indicator) => {
+				indicators.push(indicator);
+			}),
+			ui,
+			checkShutdownRequested: vi.fn(async () => {}),
+		};
+
+		await (InteractiveMode as any).prototype.handleEvent.call(fakeThis, { type: "agent_settled" });
+
+		expect(fakeThis.activeCancellationRequest).toBeUndefined();
+		expect(fakeThis.cancellationLatencySamples).toHaveLength(1);
+		expect(indicators).toHaveLength(1);
+		expect(indicators[0].kind).toBe("cancellation");
+		expect(fakeThis.checkShutdownRequested).toHaveBeenCalledTimes(1);
+		indicators.forEach((indicator) => {
+			indicator.dispose();
+		});
+	});
+});
+
 describe("InteractiveMode.setToolsExpanded", () => {
 	test("applies expansion state to the active header and chat entries", () => {
 		const header = { setExpanded: vi.fn() };

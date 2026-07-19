@@ -162,7 +162,14 @@ export type AgentSessionEvent =
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
 
 /** Listener function for agent session events */
-export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
+export type AgentSessionEventListener = (event: AgentSessionEvent) => Promise<void> | void;
+
+export interface SessionPhysicalWorkFailure {
+	generation: number;
+	label: string;
+	error: unknown;
+	timestamp: number;
+}
 
 // ============================================================================
 // Types
@@ -294,6 +301,11 @@ export class AgentSession {
 	private _isAgentRunActive = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
+	private _agentEventGeneration = 0;
+	private _activeAgentSignal: AbortSignal | undefined;
+	private readonly _physicalWork = new Set<Promise<void>>();
+	private readonly _physicalWorkFailures: SessionPhysicalWorkFailure[] = [];
+	private readonly _persistedRunMessages = new WeakSet<object>();
 
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
@@ -523,10 +535,30 @@ export class AgentSession {
 	// Event Subscription
 	// =========================================================================
 
-	/** Emit an event to all listeners */
+	private _trackPhysicalWork(
+		work: PromiseLike<unknown>,
+		label: string,
+		generation = this._agentEventGeneration,
+	): void {
+		const observed = Promise.resolve(work).then(
+			() => {},
+			(error: unknown) => {
+				this._physicalWorkFailures.push({ generation, label, error, timestamp: Date.now() });
+			},
+		);
+		this._physicalWork.add(observed);
+		void observed.then(() => this._physicalWork.delete(observed));
+	}
+
+	/** Emit an event to all listeners without allowing observational work to gate idle. */
 	private _emit(event: AgentSessionEvent): void {
-		for (const l of this._eventListeners) {
-			l(event);
+		for (const listener of this._eventListeners) {
+			try {
+				const work = listener(event);
+				if (work) this._trackPhysicalWork(work, `session listener:${event.type}`);
+			} catch (error) {
+				this._trackPhysicalWork(Promise.reject(error), `session listener:${event.type}`);
+			}
 		}
 	}
 
@@ -557,92 +589,114 @@ export class AgentSession {
 		resolve();
 	}
 
-	private async _emitAgentSettled(): Promise<void> {
+	private _emitAgentSettled(): void {
 		this._isAgentRunActive = false;
-		try {
-			await this._extensionRunner.emit({ type: "agent_settled" });
-			this._emit({ type: "agent_settled" });
-		} finally {
-			this._resolveIdleWaitIfIdle();
-		}
+		this._resolveIdleWaitIfIdle();
+		const extensionDelivery = this._extensionRunner.emit({ type: "agent_settled" });
+		this._trackPhysicalWork(extensionDelivery, "extension event:agent_settled");
+		this._emit({ type: "agent_settled" });
 	}
 
 	// Track last assistant message for auto-compaction check
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
-	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
-		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
-		// This ensures the UI sees the updated queue state
-		if (event.type === "message_start" && event.message.role === "user") {
-			this._overflowRecoveryAttempted = false;
-			const messageText = this._getUserMessageText(event.message);
-			if (messageText) {
-				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
-				if (steeringIndex !== -1) {
-					this._steeringMessages.splice(steeringIndex, 1);
-					this._emitQueueUpdate();
-				} else {
-					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
-					if (followUpIndex !== -1) {
-						this._followUpMessages.splice(followUpIndex, 1);
-						this._emitQueueUpdate();
-					}
-				}
-			}
+	/** Internal handler for agent events, guarded by the invocation signal identity. */
+	private _handleAgentEvent = async (event: AgentEvent, signal: AbortSignal): Promise<void> => {
+		if (event.type === "agent_start") {
+			this._activeAgentSignal = signal;
+			this._agentEventGeneration++;
+		}
+		if (this._activeAgentSignal !== signal) return;
+		const generation = this._agentEventGeneration;
+		const abortedAtEntry = signal.aborted;
+
+		this._applyQueueEvent(event);
+		if (abortedAtEntry) {
+			this._applyAgentEvent(event);
+			this._trackPhysicalWork(
+				this._emitExtensionEvent(event, () => false),
+				`extension event:${event.type}`,
+				generation,
+			);
+			return;
 		}
 
-		// Emit to extensions first
-		await this._emitExtensionEvent(event);
+		await this._emitExtensionEvent(
+			event,
+			() => this._activeAgentSignal === signal && !signal.aborted && this._agentEventGeneration === generation,
+		);
+		if (this._activeAgentSignal !== signal || signal.aborted || this._agentEventGeneration !== generation) return;
+		this._applyAgentEvent(event);
+	};
 
-		// Notify all listeners
+	private _applyQueueEvent(event: AgentEvent): void {
+		if (event.type !== "message_start" || event.message.role !== "user") return;
+		this._overflowRecoveryAttempted = false;
+		const messageText = this._getUserMessageText(event.message);
+		if (!messageText) return;
+		const steeringIndex = this._steeringMessages.indexOf(messageText);
+		if (steeringIndex !== -1) {
+			this._steeringMessages.splice(steeringIndex, 1);
+			this._emitQueueUpdate();
+			return;
+		}
+		const followUpIndex = this._followUpMessages.indexOf(messageText);
+		if (followUpIndex !== -1) {
+			this._followUpMessages.splice(followUpIndex, 1);
+			this._emitQueueUpdate();
+		}
+	}
+
+	private _applyAgentEvent(event: AgentEvent): void {
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
-		// Handle session persistence
 		if (event.type === "message_end") {
-			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
-				// Persist as CustomMessageEntry
-				this.sessionManager.appendCustomMessageEntry(
-					event.message.customType,
-					event.message.content,
-					event.message.display,
-					event.message.details,
-				);
-			} else if (
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
-			) {
-				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
-			}
-			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
+			this._persistRunMessage(event.message);
+			if (event.message.role === "assistant") this._trackAssistantMessage(event.message);
+			return;
+		}
+		if (event.type !== "agent_end") return;
 
-			// Track assistant message for auto-compaction (checked on agent_end)
-			if (event.message.role === "assistant") {
-				this._lastAssistantMessage = event.message;
-
-				const assistantMsg = event.message as AssistantMessage;
-				if (assistantMsg.stopReason !== "error") {
-					this._overflowRecoveryAttempted = false;
-				}
-
-				// Reset retry counter immediately on successful assistant response
-				// This prevents accumulation across multiple LLM calls within a turn
-				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
-					this._emit({
-						type: "auto_retry_end",
-						success: true,
-						attempt: this._retryAttempt,
-					});
-					this._retryAttempt = 0;
-				}
+		// Abort may detach a message_end extension handler. Reconcile the run's committed
+		// transcript before logical idle without duplicating normally persisted messages.
+		for (const message of event.messages) this._persistRunMessage(message);
+		for (let index = event.messages.length - 1; index >= 0; index--) {
+			const message = event.messages[index];
+			if (message.role === "assistant") {
+				this._trackAssistantMessage(message);
+				break;
 			}
 		}
-	};
+	}
+
+	private _persistRunMessage(message: AgentMessage): void {
+		if (this._persistedRunMessages.has(message)) return;
+		this._persistedRunMessages.add(message);
+		if (message.role === "custom") {
+			this.sessionManager.appendCustomMessageEntry(
+				message.customType,
+				message.content,
+				message.display,
+				message.details,
+			);
+		} else if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
+			this.sessionManager.appendMessage(message);
+		}
+	}
+
+	private _trackAssistantMessage(message: AssistantMessage): void {
+		this._lastAssistantMessage = message;
+		if (message.stopReason !== "error") this._overflowRecoveryAttempted = false;
+		if (message.stopReason !== "error" && this._retryAttempt > 0) {
+			this._emit({
+				type: "auto_retry_end",
+				success: true,
+				attempt: this._retryAttempt,
+			});
+			this._retryAttempt = 0;
+		}
+	}
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		const settings = this.settingsManager.getRetrySettings();
@@ -696,8 +750,8 @@ export class AgentSession {
 		Object.assign(targetRecord, replacement);
 	}
 
-	/** Emit extension events based on agent events */
-	private async _emitExtensionEvent(event: AgentEvent): Promise<void> {
+	/** Emit extension events based on agent events. */
+	private async _emitExtensionEvent(event: AgentEvent, mayMutate: () => boolean = () => true): Promise<void> {
 		if (event.type === "agent_start") {
 			this._turnIndex = 0;
 			await this._extensionRunner.emit({ type: "agent_start" });
@@ -738,7 +792,7 @@ export class AgentSession {
 				message: event.message,
 			};
 			const replacement = await this._extensionRunner.emitMessageEnd(extensionEvent);
-			if (replacement) {
+			if (replacement && mayMutate()) {
 				// Untyped extension handlers can return messages with null/missing content;
 				// normalize so it never enters agent state or session history.
 				const normalized =
@@ -1056,7 +1110,7 @@ export class AgentSession {
 		} finally {
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
-			await this._emitAgentSettled();
+			this._emitAgentSettled();
 		}
 	}
 
@@ -1524,20 +1578,28 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
-	/**
-	 * Abort current operation and wait for agent to become idle.
-	 */
-	async abort(): Promise<void> {
+	/** Abort the current operation and wait only for logical session idle. */
+	async abort(reason: unknown = new Error("User aborted")): Promise<void> {
 		this.abortRetry();
-		this.agent.abort();
+		this.agent.requestAbort(reason);
 		await this.waitForIdle();
 	}
 
 	async waitForIdle(): Promise<void> {
-		if (this.isIdle) {
-			return;
-		}
+		if (this.isIdle) return;
 		await this._getIdleWaitPromise();
+	}
+
+	/** Wait for core cleanup plus detached session and extension observers. */
+	async waitForPhysicalSettlement(): Promise<void> {
+		while (true) {
+			await Promise.all([this.agent.waitForPhysicalSettlement(), ...this._physicalWork]);
+			if (this._physicalWork.size === 0) return;
+		}
+	}
+
+	get physicalWorkFailures(): readonly SessionPhysicalWorkFailure[] {
+		return this._physicalWorkFailures.slice();
 	}
 
 	// =========================================================================

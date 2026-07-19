@@ -125,6 +125,7 @@ import { SettingsSelectorComponent } from "./components/settings-selector.ts";
 import { SkillInvocationMessageComponent } from "./components/skill-invocation-message.ts";
 import {
 	BranchSummaryStatusIndicator,
+	CancellationStatusIndicator,
 	CompactionStatusIndicator,
 	IdleStatus,
 	RetryStatusIndicator,
@@ -346,6 +347,10 @@ export class InteractiveMode {
 
 	private lastSigintTime = 0;
 	private lastEscapeTime = 0;
+	private activeCancellationRequest: number | undefined;
+	private nextCancellationRequest = 0;
+	private escapeReceivedAt: number | undefined;
+	private readonly cancellationLatencySamples: number[] = [];
 	private changelogMarkdown: string | undefined = undefined;
 	private startupNoticesShown = false;
 	private anthropicSubscriptionWarningShown = false;
@@ -1610,7 +1615,7 @@ export class InteractiveMode {
 			uiContext,
 			mode: "tui",
 			abortHandler: () => {
-				this.restoreQueuedMessagesToEditor({ abort: true });
+				this.requestInteractiveAbort();
 			},
 			commandContextActions: {
 				waitForIdle: () => this.session.waitForIdle(),
@@ -1767,7 +1772,7 @@ export class InteractiveMode {
 			isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 			signal: this.session.agent.signal,
 			abort: () => {
-				this.restoreQueuedMessagesToEditor({ abort: true });
+				this.requestInteractiveAbort();
 			},
 			hasPendingMessages: () => this.session.pendingMessageCount > 0,
 			shutdown: () => {
@@ -2522,12 +2527,28 @@ export class InteractiveMode {
 	// Key Handlers
 	// =========================================================================
 
+	private requestInteractiveAbort(): void {
+		if (this.activeCancellationRequest !== undefined) {
+			this.agent.requestAbort(new Error("Escape pressed again"));
+			return;
+		}
+		this.activeCancellationRequest = ++this.nextCancellationRequest;
+		this.escapeReceivedAt = performance.now();
+		this.restoreQueuedMessagesToEditor();
+		this.agent.requestAbort(new Error("Escape pressed"));
+		if (this.settingsManager.getShowTerminalProgress()) {
+			this.ui.terminal.setProgress(false);
+		}
+		this.showStatusIndicator(new CancellationStatusIndicator(this.ui, "Cancelling..."));
+		this.ui.requestRender();
+	}
+
 	private setupKeyHandlers(): void {
 		// Set up handlers on defaultEditor - they use this.editor for text access
 		// so they work correctly regardless of which editor is active
 		this.defaultEditor.onEscape = () => {
 			if (this.session.isStreaming) {
-				this.restoreQueuedMessagesToEditor({ abort: true });
+				this.requestInteractiveAbort();
 			} else if (this.session.isBashRunning) {
 				this.session.abortBash();
 			} else if (this.isBashMode) {
@@ -2819,6 +2840,8 @@ export class InteractiveMode {
 
 		switch (event.type) {
 			case "agent_start":
+				this.activeCancellationRequest = undefined;
+				this.escapeReceivedAt = undefined;
 				this.pendingTools.clear();
 				if (this.settingsManager.getShowTerminalProgress()) {
 					this.ui.terminal.setProgress(true);
@@ -3023,6 +3046,16 @@ export class InteractiveMode {
 				break;
 
 			case "agent_settled":
+				if (this.activeCancellationRequest !== undefined) {
+					if (this.escapeReceivedAt !== undefined) {
+						this.cancellationLatencySamples.push(performance.now() - this.escapeReceivedAt);
+						if (this.cancellationLatencySamples.length > 32) this.cancellationLatencySamples.shift();
+					}
+					this.activeCancellationRequest = undefined;
+					this.escapeReceivedAt = undefined;
+					this.showStatusIndicator(new CancellationStatusIndicator(this.ui, "Cancelled"));
+					this.ui.requestRender();
+				}
 				await this.checkShutdownRequested();
 				break;
 
@@ -3950,24 +3983,18 @@ export class InteractiveMode {
 		}
 	}
 
-	private restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
+	private restoreQueuedMessagesToEditor(options?: { currentText?: string }): number {
 		const { steering, followUp } = this.clearAllQueues();
 		const allQueued = [...steering, ...followUp];
 		if (allQueued.length === 0) {
 			this.updatePendingMessagesDisplay();
-			if (options?.abort) {
-				this.agent.abort();
-			}
 			return 0;
 		}
 		const queuedText = allQueued.join("\n\n");
 		const currentText = options?.currentText ?? this.editor.getText();
-		const combinedText = [queuedText, currentText].filter((t) => t.trim()).join("\n\n");
+		const combinedText = [queuedText, currentText].filter((text) => text.trim()).join("\n\n");
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
-		if (options?.abort) {
-			this.agent.abort();
-		}
 		return allQueued.length;
 	}
 

@@ -4,7 +4,7 @@ import { theme } from "../theme/theme.ts";
 import { CountdownTimer } from "./countdown-timer.ts";
 import { keyText } from "./keybinding-hints.ts";
 
-export type StatusIndicatorKind = "working" | "retry" | "compaction" | "branchSummary";
+export type StatusIndicatorKind = "working" | "retry" | "compaction" | "branchSummary" | "cancellation";
 
 export class StatusIndicator extends Loader {
 	readonly kind: StatusIndicatorKind;
@@ -36,6 +36,20 @@ export class WorkingStatusIndicator extends StatusIndicator {
 			message,
 			indicator,
 		);
+	}
+}
+
+export class CancellationStatusIndicator extends StatusIndicator {
+	constructor(ui: TUI, message: "Cancelling..." | "Cancelled") {
+		super(
+			"cancellation",
+			ui,
+			(spinner) => theme.fg("warning", spinner),
+			(text) => theme.fg("muted", text),
+			message,
+		);
+		// Cancellation state is intentionally static; the working animation no longer owns the UI.
+		this.stop();
 	}
 }
 

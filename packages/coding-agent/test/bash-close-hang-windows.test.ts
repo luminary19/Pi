@@ -1,10 +1,11 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { executeBashWithOperations } from "../src/core/bash-executor.ts";
 import { createBashTool, createLocalBashOperations } from "../src/core/tools/bash.ts";
+import { killProcessTree } from "../src/utils/shell.ts";
 
 function toBashSingleQuotedArg(value: string): string {
 	return `'${value.replace(/\\/g, "/").replace(/'/g, `'"'"'`)}'`;
@@ -121,6 +122,23 @@ describe.skipIf(process.platform !== "win32")("Windows child-process close handl
 		} finally {
 			controller.abort();
 			cleanupDetachedChild(pidFile);
+		}
+	});
+
+	it("reports bounded Windows process-tree termination", async () => {
+		const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		if (!child.pid) throw new Error("Child process did not expose a pid");
+		try {
+			const result = await withTimeout(killProcessTree(child.pid), 3000, () => child.kill());
+			expect(result.pid).toBe(child.pid);
+			expect(result.status).toBe("confirmed");
+			expect(result.durationMs).toBeLessThan(3000);
+			expect(["taskkill", "direct-child"]).toContain(result.method);
+		} finally {
+			child.kill();
 		}
 	});
 });
