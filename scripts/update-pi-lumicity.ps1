@@ -101,7 +101,13 @@ try {
     Invoke-Native npm --workspace "@earendil-works/pi-agent-core" test -- --run test/cancellation.test.ts test/agent.test.ts test/agent-loop.test.ts
     Invoke-Native npm --workspace "@earendil-works/pi-coding-agent" test -- test/suite/regressions/6363-agent-settled-event.test.ts test/interactive-mode-status.test.ts test/bash-close-hang-windows.test.ts
     Invoke-Native -FilePath npm -Arguments @("--workspace", "@earendil-works/pi-coding-agent", "test", "--", "test/package-command-paths.test.ts", "-t", "refuses .* self-update")
-    Invoke-Native npm run build
+    # Release builds must use the committed generated catalogs. The workspace's
+    # ordinary AI build refreshes them from mutable network APIs, which is not
+    # reproducible and can change source contracts during a verified update.
+    Invoke-Native npm --workspace "@earendil-works/pi-tui" run build
+    Invoke-Native npm exec -- tsgo -p packages/ai/tsconfig.build.json
+    Invoke-Native npm --workspace "@earendil-works/pi-agent-core" run build
+    Invoke-Native npm --workspace "@earendil-works/pi-coding-agent" run build
 
     if (-not (Test-Path $SubagentsRoot)) {
         throw "Required Lumicity subagent extension not found: $SubagentsRoot"
